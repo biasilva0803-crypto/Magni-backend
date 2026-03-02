@@ -13,15 +13,16 @@ async def startup_db():
 
     mongo_uri = os.getenv("MONGODB_URI")
 
-    if not mongo_uri:
+    if mongo_uri is None:
         print("❌ MONGODB_URI não definida")
         return
 
     try:
         client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        db = client.get_default_database() or client["magni"]
 
-        # Testar ligação
+        # Define explicitamente a base de dados
+        db = client["magni"]
+
         await db.command("ping")
         print("✅ MongoDB ligado com sucesso")
 
@@ -34,7 +35,7 @@ async def startup_db():
 @app.on_event("shutdown")
 async def shutdown_db():
     global client
-    if client:
+    if client is not None:
         client.close()
 
 
