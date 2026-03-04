@@ -3,3 +3,5 @@ uvicorn==0.30.6
 motor==3.5.1
 pymongo==4.8.0
 python-dotenv==1.0.1
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
