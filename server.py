@@ -1,4 +1,5 @@
 import os
+import hashlib
 from datetime import datetime
 from typing import Optional
 
@@ -23,11 +24,12 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def normalize_password(p: str) -> str:
     """
-    bcrypt só aceita até 72 bytes.
-    Isto remove espaços no início/fim e corta para 72 bytes.
+    bcrypt tem limite de 72 bytes. Para evitar problemas com espaços/acentos/cópias,
+    transformamos a password num digest SHA-256 (tamanho fixo).
+    Depois bcrypt faz hash desse digest.
     """
-    p = (p or "").strip()
-    return p.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+    raw = (p or "").strip().encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 # ---------------- MODELS ----------------
@@ -43,7 +45,7 @@ class Login(BaseModel):
     password: str
 
 
-# ---------------- STARTUP ----------------
+# ---------------- STARTUP / SHUTDOWN ----------------
 @app.on_event("startup")
 async def startup():
     global client, db
@@ -58,6 +60,7 @@ async def startup():
     try:
         await db.command("ping")
         print("✅ MongoDB ligado com sucesso")
+        # garante email único
         await db.users.create_index("email", unique=True)
     except Exception as e:
         print(f"❌ erro ao ligar ao MongoDB: {e}")
@@ -106,12 +109,9 @@ async def setup_admin(data: SetupAdmin):
     if admin:
         raise HTTPException(status_code=400, detail="Admin já existe")
 
-    # password segura (limite bcrypt)
-    pw = normalize_password(data.password)
-    if len(pw) < 3:
-        raise HTTPException(status_code=400, detail="Password demasiado curta")
-
-    password_hash = pwd_context.hash(pw)
+    # password -> digest -> bcrypt
+    pw_digest = normalize_password(data.password)
+    password_hash = pwd_context.hash(pw_digest)
 
     user = {
         "email": data.email.strip().lower(),
@@ -147,9 +147,9 @@ async def login(data: Login):
     if not user:
         raise HTTPException(status_code=401, detail="credenciais inválidas")
 
-    pw = normalize_password(data.password)
+    pw_digest = normalize_password(data.password)
 
-    if not pwd_context.verify(pw, user["password"]):
+    if not pwd_context.verify(pw_digest, user["password"]):
         raise HTTPException(status_code=401, detail="credenciais inválidas")
 
     token = jwt.encode(
