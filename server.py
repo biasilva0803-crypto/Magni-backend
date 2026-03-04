@@ -11,19 +11,26 @@ from jose import jwt
 app = FastAPI()
 
 # ---------------- CONFIG ----------------
-
 MONGODB_URI = os.getenv("MONGODB_URI")
 JWT_SECRET = os.getenv("JWT_SECRET")
 SETUP_KEY = os.getenv("SETUP_KEY")
 
-client = None
+client: Optional[AsyncIOMotorClient] = None
 db = None
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
+def normalize_password(p: str) -> str:
+    """
+    bcrypt só aceita até 72 bytes.
+    Isto remove espaços no início/fim e corta para 72 bytes.
+    """
+    p = (p or "").strip()
+    return p.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+
+
 # ---------------- MODELS ----------------
-
-
 class SetupAdmin(BaseModel):
     setup_key: str
     email: str
@@ -37,8 +44,6 @@ class Login(BaseModel):
 
 
 # ---------------- STARTUP ----------------
-
-
 @app.on_event("startup")
 async def startup():
     global client, db
@@ -53,80 +58,98 @@ async def startup():
     try:
         await db.command("ping")
         print("✅ MongoDB ligado com sucesso")
-    except:
-        print("❌ erro ao ligar ao MongoDB")
+        await db.users.create_index("email", unique=True)
+    except Exception as e:
+        print(f"❌ erro ao ligar ao MongoDB: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global client
+    if client is not None:
+        client.close()
 
 
 # ---------------- ROOT ----------------
-
-
 @app.get("/")
 def root():
     return {"status": "ok", "service": "magni-backend"}
 
 
 # ---------------- DB TEST ----------------
-
-
 @app.get("/db-test")
 async def db_test():
-
     if db is None:
         return {"error": "DB não conectada"}
 
     try:
         await db.command("ping")
         return {"ok": True}
-    except:
-        return {"error": "erro ao ligar ao MongoDB"}
+    except Exception as e:
+        return {"error": f"erro ao ligar ao MongoDB: {e}"}
 
 
 # ---------------- CREATE ADMIN ----------------
-
-
 @app.post("/setup-admin")
 async def setup_admin(data: SetupAdmin):
+    if db is None:
+        raise HTTPException(status_code=500, detail="DB não conectada (ver MONGODB_URI)")
 
-    if SETUP_KEY != data.setup_key:
+    if not SETUP_KEY:
+        raise HTTPException(status_code=500, detail="SETUP_KEY não definido no Railway")
+
+    if data.setup_key != SETUP_KEY:
         raise HTTPException(status_code=403, detail="setup_key inválida")
 
+    # já existe admin?
     admin = await db.users.find_one({"role": "admin"})
-
     if admin:
         raise HTTPException(status_code=400, detail="Admin já existe")
 
-    password_hash = pwd_context.hash(data.password)
+    # password segura (limite bcrypt)
+    pw = normalize_password(data.password)
+    if len(pw) < 3:
+        raise HTTPException(status_code=400, detail="Password demasiado curta")
+
+    password_hash = pwd_context.hash(pw)
 
     user = {
-        "email": data.email,
+        "email": data.email.strip().lower(),
         "password": password_hash,
-        "name": data.name,
+        "name": data.name.strip(),
         "role": "admin",
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
     }
 
-    result = await db.users.insert_one(user)
+    try:
+        result = await db.users.insert_one(user)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao criar admin: {e}")
 
     return {
         "id": str(result.inserted_id),
-        "email": data.email,
+        "email": user["email"],
         "role": "admin",
-        "name": data.name,
+        "name": user["name"],
     }
 
 
 # ---------------- LOGIN ----------------
-
-
 @app.post("/login")
 async def login(data: Login):
+    if db is None:
+        raise HTTPException(status_code=500, detail="DB não conectada (ver MONGODB_URI)")
 
-    user = await db.users.find_one({"email": data.email})
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET não definido no Railway")
 
+    user = await db.users.find_one({"email": data.email.strip().lower()})
     if not user:
         raise HTTPException(status_code=401, detail="credenciais inválidas")
 
-    if not pwd_context.verify(data.password, user["password"]):
+    pw = normalize_password(data.password)
+
+    if not pwd_context.verify(pw, user["password"]):
         raise HTTPException(status_code=401, detail="credenciais inválidas")
 
     token = jwt.encode(
@@ -138,5 +161,5 @@ async def login(data: Login):
     return {
         "token": token,
         "role": user["role"],
-        "name": user["name"],
+        "name": user.get("name", ""),
     }
