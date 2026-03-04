@@ -1,121 +1,142 @@
 import os
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import jwt
 
 app = FastAPI()
 
-client: Optional[AsyncIOMotorClient] = None
+# ---------------- CONFIG ----------------
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+JWT_SECRET = os.getenv("JWT_SECRET")
+SETUP_KEY = os.getenv("SETUP_KEY")
+
+client = None
 db = None
 
-# ---------- Models ----------
-class NoteCreate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=120)
-    content: str = Field(..., min_length=1, max_length=5000)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-class NoteOut(BaseModel):
-    id: str
-    title: str
-    content: str
-    created_at: str
+# ---------------- MODELS ----------------
 
-# ---------- Startup / Shutdown ----------
+
+class SetupAdmin(BaseModel):
+    setup_key: str
+    email: str
+    password: str
+    name: str
+
+
+class Login(BaseModel):
+    email: str
+    password: str
+
+
+# ---------------- STARTUP ----------------
+
+
 @app.on_event("startup")
-async def startup_db():
+async def startup():
     global client, db
-    mongo_uri = os.getenv("MONGODB_URI")
-    if mongo_uri is None:
+
+    if not MONGODB_URI:
         print("❌ MONGODB_URI não definida")
         return
 
-    client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
-    db = client["magni"]
+    client = AsyncIOMotorClient(MONGODB_URI)
+    db = client.magni
 
-    # Ping
-    await db.command("ping")
-    print("✅ MongoDB ligado com sucesso")
+    try:
+        await db.command("ping")
+        print("✅ MongoDB ligado com sucesso")
+    except:
+        print("❌ erro ao ligar ao MongoDB")
 
-@app.on_event("shutdown")
-async def shutdown_db():
-    global client
-    if client is not None:
-        client.close()
 
-# ---------- Helpers ----------
-def doc_to_note(doc) -> NoteOut:
-    return NoteOut(
-        id=str(doc["_id"]),
-        title=doc["title"],
-        content=doc["content"],
-        created_at=doc["created_at"],
-    )
+# ---------------- ROOT ----------------
 
-def ensure_db():
-    if db is None:
-        raise HTTPException(status_code=500, detail="DB não conectada (MONGODB_URI em falta?)")
 
-# ---------- Routes ----------
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok", "service": "magni-backend"}
+
+
+# ---------------- DB TEST ----------------
+
 
 @app.get("/db-test")
 async def db_test():
-    ensure_db()
-    await db.command("ping")
-    return {"ok": True}
 
-# Create
-@app.post("/notes", response_model=NoteOut)
-async def create_note(payload: NoteCreate):
-    ensure_db()
-    doc = {
-        "title": payload.title,
-        "content": payload.content,
-        "created_at": datetime.utcnow().isoformat() + "Z",
+    if db is None:
+        return {"error": "DB não conectada"}
+
+    try:
+        await db.command("ping")
+        return {"ok": True}
+    except:
+        return {"error": "erro ao ligar ao MongoDB"}
+
+
+# ---------------- CREATE ADMIN ----------------
+
+
+@app.post("/setup-admin")
+async def setup_admin(data: SetupAdmin):
+
+    if SETUP_KEY != data.setup_key:
+        raise HTTPException(status_code=403, detail="setup_key inválida")
+
+    admin = await db.users.find_one({"role": "admin"})
+
+    if admin:
+        raise HTTPException(status_code=400, detail="Admin já existe")
+
+    password_hash = pwd_context.hash(data.password)
+
+    user = {
+        "email": data.email,
+        "password": password_hash,
+        "name": data.name,
+        "role": "admin",
+        "created_at": datetime.utcnow(),
     }
-    res = await db.notes.insert_one(doc)
-    saved = await db.notes.find_one({"_id": res.inserted_id})
-    return doc_to_note(saved)
 
-# Read all
-@app.get("/notes", response_model=List[NoteOut])
-async def list_notes(limit: int = 50):
-    ensure_db()
-    limit = max(1, min(limit, 200))
-    cursor = db.notes.find().sort("created_at", -1).limit(limit)
-    docs = await cursor.to_list(length=limit)
-    return [doc_to_note(d) for d in docs]
+    result = await db.users.insert_one(user)
 
-# Read one
-@app.get("/notes/{note_id}", response_model=NoteOut)
-async def get_note(note_id: str):
-    ensure_db()
-    from bson import ObjectId
-    try:
-        oid = ObjectId(note_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="note_id inválido")
+    return {
+        "id": str(result.inserted_id),
+        "email": data.email,
+        "role": "admin",
+        "name": data.name,
+    }
 
-    doc = await db.notes.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Nota não encontrada")
-    return doc_to_note(doc)
 
-# Delete
-@app.delete("/notes/{note_id}")
-async def delete_note(note_id: str):
-    ensure_db()
-    from bson import ObjectId
-    try:
-        oid = ObjectId(note_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="note_id inválido")
+# ---------------- LOGIN ----------------
 
-    res = await db.notes.delete_one({"_id": oid})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Nota não encontrada")
-    return {"ok": True}
+
+@app.post("/login")
+async def login(data: Login):
+
+    user = await db.users.find_one({"email": data.email})
+
+    if not user:
+        raise HTTPException(status_code=401, detail="credenciais inválidas")
+
+    if not pwd_context.verify(data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="credenciais inválidas")
+
+    token = jwt.encode(
+        {"user_id": str(user["_id"]), "role": user["role"]},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+    return {
+        "token": token,
+        "role": user["role"],
+        "name": user["name"],
+    }
